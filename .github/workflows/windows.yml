@@ -45,7 +45,7 @@ jobs:
         run: |
           $folder = Join-Path $env:RUNNER_TEMP 'CredentialStudioSmoke'
           $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$folder")
-          $p = Start-Process dist\installer\CredentialStudio-0.1.0-Setup-x64.exe -ArgumentList $arguments -Wait -PassThru
+          $p = Start-Process dist\installer\CredentialStudio-0.2.0-Setup-x64.exe -ArgumentList $arguments -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw 'Installer failed' }
           $p = Start-Process "$folder\CredentialStudio.exe" -ArgumentList '--smoke-test' -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw 'Installed executable failed' }

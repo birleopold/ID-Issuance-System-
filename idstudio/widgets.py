@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
     QSlider, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
@@ -27,6 +27,54 @@ def button(label, callback, primary=False):
 
 def show_error(parent, exc):
     QMessageBox.warning(parent, "Action needs attention", str(exc))
+
+
+class CSVImportDialog(QDialog):
+    def __init__(self, store, rows, parent=None):
+        super().__init__(parent)
+        self.store, self.rows = store, rows
+        self.setWindowTitle("Review CSV enrollment")
+        self.resize(1120, 650)
+        layout = QVBoxLayout(self)
+        label = QLabel("Review every row before importing. All records become drafts; photographs, signatures and capture authorization must be completed separately.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        form = QFormLayout()
+        self.template = QComboBox()
+        self.template.addItems(store.templates())
+        form.addRow("Template for this batch", self.template)
+        layout.addLayout(form)
+        self.table = QTableWidget(len(rows), 6)
+        self.table.setHorizontalHeaderLabels(["Card number", "Full name", "Department", "Role", "Expiry", "Review"])
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table, 1)
+        self.feedback = QLabel()
+        self.feedback.setWordWrap(True)
+        layout.addWidget(self.feedback)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(button("Cancel", self.reject))
+        self.import_button = button("Import drafts", self.accept, True)
+        actions.addWidget(self.import_button)
+        layout.addLayout(actions)
+        self.template.currentTextChanged.connect(self.review)
+        self.review()
+
+    def review(self, *_):
+        from .importing import COLUMNS, review_rows
+        errors = review_rows(self.store, self.rows, self.template.currentText())
+        for row, (values, error) in enumerate(zip(self.rows, errors)):
+            for column, value in enumerate([*(values[key] for key in COLUMNS), error or "Ready as draft"]):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                if column == 5 and error:
+                    item.setForeground(QColor("#b93846"))
+                self.table.setItem(row, column, item)
+        failures = sum(bool(error) for error in errors)
+        self.table.resizeRowsToContents()
+        self.import_button.setEnabled(not failures)
+        self.feedback.setText(f"{len(self.rows)} records · {failures} rows need correction. Correct the CSV and reopen it." if failures else f"{len(self.rows)} records ready. The entire batch is saved together or none is saved.")
 
 
 class ImagePreview(QLabel):

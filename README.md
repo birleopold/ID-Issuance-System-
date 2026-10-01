@@ -4,20 +4,20 @@
 
 Credential Studio brings cardholder details, camera portraits, handwritten signatures, card templates and printer output into one local workspace. Built for staff, school, membership and visitor credential programs, it helps an operator move from enrollment to a reviewed, traceable card without switching between design software, image editors and spreadsheets.
 
-**Status: v0.1.0 — functional pilot implementation.** This repository contains a working desktop application, automated tests, Windows packaging and a customer handover guide. It is not yet a hardware-certified or production-accredited release. Use the [acceptance checklist](docs/ACCEPTANCE.md) before selling a deployment as production ready.
+**Status: v0.2.0 — functional pilot implementation.** This repository contains a working desktop application, automated tests, Windows packaging and a customer handover guide. It is not yet a hardware-certified or production-accredited release. Use the [acceptance checklist](docs/ACCEPTANCE.md) before selling a deployment as production ready.
 
 ## What you can do
 
 | Workspace | Capabilities |
 |---|---|
 | Overview | Live local counts, recent enrollments, unresolved print jobs |
-| Cardholders | Search name/card number, filter by status, open records, administrator CSV export |
+| Cardholders | Paginated name/card-number search, status and expired-card filters, administrator CSV draft import with review, full matching-result CSV export |
 | Enrollment | Required-field checks, duplicate ID protection, expiry dates, photo import, live camera capture, drag/zoom portrait framing |
 | Signatures | Draw with mouse/touch/pen, import a signature image, capture through the Windows Wacom COM adapter |
 | Template studio | Two starter designs, organization branding, front/back layouts, custom image backgrounds, millimeter position/size controls, live preview, JSON import/export |
 | Review & issuance | Administrator approval, draft watermarking, revision protection, revocation and reasoned reprints |
 | Printing | Discover installed printers, select front/back/automatic duplex, validate CR80 form, submit through the native Qt/Windows driver stack |
-| Print history | Immutable rendered snapshots, submitted/uncertain/confirmed states, physical-output confirmation, interruption recovery without automatic reprinting |
+| Print history | Immutable rendered snapshots with requested sides, submitted/uncertain/confirmed states, physical-output confirmation, interruption recovery without automatic reprinting |
 | Administration | First-run administrator setup, operator accounts, password change, account disabling, audit history, idle lock, full backup and safe restore |
 
 ## Operator workflow
@@ -33,6 +33,8 @@ Credential Studio brings cardholder details, camera portraits, handwritten signa
 9. Inspect the physical output. In **Print history**, choose **Confirm printed** only when the requested output is correct.
 
 Shortcuts: **Ctrl+N** new enrollment, **Ctrl+S** save enrollment, **Ctrl+L** lock. Unsaved work is retained while the same operator unlocks. Close and reopen the application to switch operator accounts.
+
+For larger rosters, an administrator can choose **Import CSV** in Cardholders, select a template and review validation results before importing up to 1,000 drafts per batch. Start with [the sample CSV](docs/cardholders-example.csv). Imports never approve cards or supply photo/signature authorization. Cardholder pages show 100 results at a time; **Export all matches** includes every matching record, not only the current page.
 
 ## Windows installer
 

@@ -24,4 +24,4 @@ $CompilerPath = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 if (-not (Test-Path $CompilerPath)) { throw 'Install Inno Setup 6 on the build computer, then rerun.' }
 & $CompilerPath packaging/installer.iss
 if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }
-Write-Host 'Installer: dist\installer\CredentialStudio-0.1.0-Setup-x64.exe'
+Write-Host 'Installer: dist\installer\CredentialStudio-0.2.0-Setup-x64.exe'

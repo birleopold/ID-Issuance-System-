@@ -1,12 +1,12 @@
 """Persistence and authorization. UI actions must go through this service."""
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import tempfile
 import uuid
@@ -84,12 +84,21 @@ class Store:
 
     @contextmanager
     def transaction(self):
+        # Nested service calls participate in the outer operation atomically.
+        savepoint = "sp_" + uuid.uuid4().hex if self.db.in_transaction else None
         try:
-            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute(f"SAVEPOINT {savepoint}" if savepoint else "BEGIN IMMEDIATE")
             yield
-            self.db.commit()
+            if savepoint:
+                self.db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                self.db.commit()
         except Exception:
-            self.db.rollback()
+            if savepoint:
+                self.db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                self.db.rollback()
             raise
 
     def audit(self, action, target="", detail=""):
@@ -135,7 +144,7 @@ class Store:
             valid = hmac.compare_digest(password_hash(password[:257], saved.split(":")[0]), saved)
             if not row or not valid or not row["active"]:
                 if row:
-                    failures = row["failures"] + 1
+                    failures = (0 if row["locked_until"] else row["failures"]) + 1
                     until = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(timespec="seconds") if failures >= 5 else None
                     self.db.execute("UPDATE users SET failures=?,locked_until=? WHERE id=?", (failures, until, row["id"]))
                 self.audit("login.failed")
@@ -164,7 +173,7 @@ class Store:
             self.db.execute("UPDATE users SET active=? WHERE id=?", (int(active), user_id))
             self.audit("account.enabled" if active else "account.disabled", str(user_id))
 
-    def save_record(self, values, record_id=None, version=None):
+    def validate_record(self, values):
         self.authorize()
         fields = ["card_no", "full_name", "department", "title", "expires", "template", "photo", "signature", "consent"]
         clean = {k: values.get(k) for k in fields}
@@ -175,9 +184,10 @@ class Store:
         if not clean["card_no"] or not clean["full_name"]:
             raise DomainError("Full name and card number are required.")
         try:
-            date.fromisoformat(clean["expires"])
+            if date.fromisoformat(clean["expires"]).isoformat() != clean["expires"]:
+                raise ValueError("Noncanonical date")
         except ValueError as exc:
-            raise DomainError("Choose a valid expiry date.") from exc
+            raise DomainError("Choose a valid expiry date in YYYY-MM-DD format.") from exc
         if not self.db.execute("SELECT 1 FROM templates WHERE name=?", (clean["template"],)).fetchone():
             raise DomainError("Choose an existing card template.")
         for media in ("photo", "signature"):
@@ -185,6 +195,11 @@ class Store:
             if blob is not None and (not isinstance(blob, bytes) or len(blob) > 8_000_000):
                 raise DomainError("Image data must be at most 8 MB.")
         clean["consent"] = int(bool(clean["consent"]))
+        return clean
+
+    def save_record(self, values, record_id=None, version=None):
+        clean = self.validate_record(values)
+        fields = list(clean)
         record_id = record_id or str(uuid.uuid4())
         try:
             with self.transaction():
@@ -211,12 +226,56 @@ class Store:
             raise DomainError("Record not found.")
         return dict(row)
 
-    def records(self, search="", status="all"):
+    def record_filter(self, search, status):
+        if status not in ("all", "draft", "approved", "issued", "revoked", "expired"):
+            raise DomainError("Unknown record filter.")
+        clause = "(instr(lower(full_name),lower(?))>0 OR instr(lower(card_no),lower(?))>0)"
+        args = [search, search]
+        if status == "expired":
+            clause += " AND expires < ? AND status != 'revoked'"
+            args.append(date.today().isoformat())
+        elif status != "all":
+            clause += " AND status=?"
+            args.append(status)
+        return clause, args
+
+    def record_count(self, search="", status="all"):
         self.authorize()
-        return self.db.execute("SELECT id,card_no,full_name,department,expires,status,version FROM records "
-                               "WHERE (instr(lower(full_name),lower(?))>0 OR instr(lower(card_no),lower(?))>0) "
-                               "AND (?='all' OR status=?) ORDER BY updated_at DESC LIMIT 1000",
-                               (search, search, status, status)).fetchall()
+        clause, args = self.record_filter(search, status)
+        return self.db.execute("SELECT count(*) FROM records WHERE " + clause, args).fetchone()[0]
+
+    def records(self, search="", status="all", limit=1000, offset=0):
+        self.authorize()
+        if not isinstance(limit, int) or not 1 <= limit <= 1000 or not isinstance(offset, int) or offset < 0:
+            raise DomainError("Invalid page size or offset.")
+        clause, args = self.record_filter(search, status)
+        return self.db.execute("SELECT id,card_no,full_name,department,expires,status,version FROM records WHERE " +
+                               clause + " ORDER BY updated_at DESC,id DESC LIMIT ? OFFSET ?", (*args, limit, offset)).fetchall()
+
+    def export_records(self, search="", status="all"):
+        """Cursor over all matches, without loading media or truncating at a UI limit."""
+        self.authorize(admin=True)
+        clause, args = self.record_filter(search, status)
+        return self.db.execute("SELECT card_no,full_name,department,expires,status FROM records WHERE " +
+                               clause + " ORDER BY updated_at DESC,id DESC", args)
+
+    def import_drafts(self, rows, template):
+        self.authorize(admin=True)
+        if not isinstance(rows, list) or not 1 <= len(rows) <= 1000:
+            raise DomainError("Import between 1 and 1,000 rows per batch.")
+        ids = []
+        with self.transaction():
+            for index, row in enumerate(rows, 1):
+                # Only identity text is accepted. CSVs cannot assign approval,
+                # consent, images, paths, IDs or existing-record updates.
+                values = {key: row.get(key, "") for key in ("card_no", "full_name", "department", "title", "expires")}
+                values.update(template=template, photo=None, signature=None, consent=False)
+                try:
+                    ids.append(self.save_record(values))
+                except DomainError as exc:
+                    raise DomainError(f"Import row {index}: {exc}. Nothing was imported.") from exc
+            self.audit("records.imported", detail=f"{len(ids)} drafts")
+        return ids
 
     def preflight(self, record):
         problems = []
@@ -246,8 +305,10 @@ class Store:
             self.db.execute("UPDATE records SET status=?,version=version+1,updated_at=? WHERE id=?", (target, now(), record_id))
             self.audit("record." + target, record_id, reason[:500])
 
-    def prepare_job(self, record_id, version, front, back, printer, reason=""):
+    def prepare_job(self, record_id, version, front, back, printer, reason="", sides="both"):
         self.authorize()
+        if sides not in ("front", "back", "both"):
+            raise DomainError("Choose front, back or both sides.")
         if not front or not back or not printer.strip():
             raise DomainError("A rendered card and printer are required.")
         with self.transaction():
@@ -269,6 +330,7 @@ class Store:
             snapshot["template_body"] = json.loads(self.db.execute("SELECT body FROM templates WHERE name=?", (record["template"],)).fetchone()[0])
             snapshot["front_sha256"] = hashlib.sha256(front).hexdigest()
             snapshot["back_sha256"] = hashlib.sha256(back).hexdigest()
+            snapshot["sides"] = sides
             self.db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?)",
                             (job_id, record_id, json.dumps(snapshot), front, back, printer, "prepared", reason[:500], now(), now()))
             self.audit("print.prepared", job_id, record_id)
@@ -316,19 +378,25 @@ class Store:
         return {r["name"]: json.loads(r["body"]) for r in self.db.execute("SELECT * FROM templates ORDER BY name")}
 
     def backup(self, destination):
+        from .fileio import atomic_output
         self.authorize(admin=True)
         destination = Path(destination)
-        if destination.resolve() == (self.folder / "studio.db").resolve():
+        protected = {"studio.db", "studio.db-wal", "studio.db-shm", "workstation.lock", "application.log"}
+        if destination.resolve() in {(self.folder / name).resolve() for name in protected}:
             raise DomainError("Choose a separate backup file.")
         with tempfile.TemporaryDirectory() as temporary:
             backup_db = Path(temporary) / "studio.db"
             with closing(sqlite3.connect(backup_db)) as connection:
                 self.db.backup(connection)
-            payload = backup_db.read_bytes()
-            manifest = {"format": 1, "created_at": now(), "sha256": hashlib.sha256(payload).hexdigest()}
-            with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
-                archive.writestr("studio.db", payload)
-                archive.writestr("manifest.json", json.dumps(manifest))
+            if backup_db.stat().st_size > 2_000_000_000:
+                raise DomainError("Database exceeds the 2 GB backup/restore limit.")
+            with backup_db.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            manifest = {"format": 1, "created_at": now(), "sha256": digest}
+            with atomic_output(destination) as temporary_archive:
+                with zipfile.ZipFile(temporary_archive, "w", zipfile.ZIP_DEFLATED) as archive:
+                    archive.write(backup_db, "studio.db")
+                    archive.writestr("manifest.json", json.dumps(manifest))
         with self.transaction():
             self.audit("backup.created")
 
@@ -338,28 +406,46 @@ class Store:
         folder = Path(folder)
         if (folder / "studio.db").exists():
             raise DomainError("Restore requires a new data folder; existing data will not be overwritten.")
-        with zipfile.ZipFile(archive_path) as archive:
-            if set(archive.namelist()) != {"studio.db", "manifest.json"}:
-                raise DomainError("Unexpected backup contents.")
-            if archive.getinfo("studio.db").file_size > 2_000_000_000 or archive.getinfo("manifest.json").file_size > 4096:
-                raise DomainError("Backup exceeds supported size.")
-            payload = archive.read("studio.db")
-            manifest = json.loads(archive.read("manifest.json"))
-            if manifest.get("format") != 1 or hashlib.sha256(payload).hexdigest() != manifest.get("sha256"):
-                raise DomainError("Backup integrity check failed.")
         folder.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=folder) as temporary:
             candidate = Path(temporary) / "studio.db"
-            candidate.write_bytes(payload)
+            with zipfile.ZipFile(archive_path) as archive:
+                if len(archive.namelist()) != 2 or set(archive.namelist()) != {"studio.db", "manifest.json"}:
+                    raise DomainError("Unexpected backup contents.")
+                if archive.getinfo("studio.db").file_size > 2_000_000_000 or archive.getinfo("manifest.json").file_size > 4096:
+                    raise DomainError("Backup exceeds supported size.")
+                manifest = json.loads(archive.read("manifest.json"))
+                with archive.open("studio.db") as source, candidate.open("wb") as output:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+                with candidate.open("rb") as source:
+                    digest = hashlib.file_digest(source, "sha256").hexdigest()
+                if manifest.get("format") != 1 or digest != manifest.get("sha256"):
+                    raise DomainError("Backup integrity check failed.")
             with closing(sqlite3.connect(candidate)) as db:
                 if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise DomainError("Backup database is damaged.")
                 if db.execute("PRAGMA user_version").fetchone()[0] != 1:
                     raise DomainError("Unsupported backup version.")
                 db.execute("SELECT id,username,password,role FROM users LIMIT 1")
+                db.execute("SELECT id,card_no,full_name,photo,signature,consent,status,version FROM records LIMIT 0")
+                db.execute("SELECT id,record_id,snapshot,front,back,status FROM jobs LIMIT 0")
+                db.execute("SELECT name,body FROM templates LIMIT 0")
+                db.execute("SELECT at,actor,action,target,detail FROM audit LIMIT 0")
+                if db.execute("PRAGMA foreign_key_check").fetchone():
+                    raise DomainError("Backup contains broken database references.")
             # Exclusive creation closes the overwrite race.
-            with (folder / "studio.db").open("xb") as output:
-                output.write(payload)
+            destination = folder / "studio.db"
+            # Remove our own incomplete output if disk-full interrupts recovery.
+            # An existing file is never opened, replaced or removed.
+            output = destination.open("xb")
+            try:
+                with output, candidate.open("rb") as source:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+                    output.flush()
+                    os.fsync(output.fileno())
+            except Exception:
+                destination.unlink(missing_ok=True)
+                raise
 
     def close(self):
         self.db.close()

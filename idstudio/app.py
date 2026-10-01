@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -22,7 +23,8 @@ from .core import DomainError, Store, data_directory
 from .devices import capture_wacom, configured_printer, printer_names, submit_print
 from .rendering import export_pdf, image_bytes, load_image, normalize_signature, render_card
 from .templates import default_templates
-from .widgets import CameraDialog, CropDialog, ImagePreview, SignatureDialog, TemplateDialog, button, show_error
+from .widgets import CSVImportDialog, CameraDialog, CropDialog, ImagePreview, SignatureDialog, TemplateDialog, button, show_error
+from .fileio import atomic_output
 
 STYLE = """
 * { font-family: 'Segoe UI', 'DejaVu Sans'; font-size: 13px; }
@@ -249,24 +251,35 @@ class MainWindow(QMainWindow):
         layout.addWidget(title("Local data • No cloud upload • Administrator approval before printing",True))
 
     def build_records(self):
+        self.record_offset=0
+        self.record_page_size=100
         layout=self.page("Cardholders","Find a credential, continue a draft or review its issuance status. Double-click a row to open.")
         bar=QHBoxLayout()
         self.search=QLineEdit()
         self.search.setPlaceholderText("Search by name or card number…")
-        self.search.textChanged.connect(self.refresh_records)
+        self.search.textChanged.connect(self.reset_record_page)
         self.status_filter=QComboBox()
-        self.status_filter.addItems(["all","draft","approved","issued","revoked"])
-        self.status_filter.currentTextChanged.connect(self.refresh_records)
+        self.status_filter.addItems(["all","draft","approved","issued","revoked","expired"])
+        self.status_filter.currentTextChanged.connect(self.reset_record_page)
         bar.addWidget(self.search,1)
         bar.addWidget(self.status_filter)
-        bar.addWidget(button("Export list",self.export_csv))
+        self.import_button=button("Import CSV",self.import_csv)
+        self.export_button=button("Export all matches",self.export_csv)
+        bar.addWidget(self.import_button)
+        bar.addWidget(self.export_button)
         bar.addWidget(button("+ New cardholder",self.new_record,True))
         layout.addLayout(bar)
         self.records_table=table(["Card number","Full name","Department","Valid to","Status"])
         self.records_table.cellDoubleClicked.connect(lambda row,_:self.open_record(self.records_table.item(row,0).data(Qt.ItemDataRole.UserRole)))
         layout.addWidget(self.records_table,1)
         self.record_count=title("",True)
-        layout.addWidget(self.record_count)
+        pager=QHBoxLayout()
+        pager.addWidget(self.record_count,1)
+        self.previous_page=button("Previous",lambda:self.move_record_page(-1))
+        self.next_page=button("Next",lambda:self.move_record_page(1))
+        pager.addWidget(self.previous_page)
+        pager.addWidget(self.next_page)
+        layout.addLayout(pager)
 
     def build_enrollment(self):
         layout=self.page("Enrollment","Capture once. Preview both sides. Save a draft before requesting approval.")
@@ -370,7 +383,7 @@ class MainWindow(QMainWindow):
 
     def build_jobs(self):
         layout=self.page("Print history","Submission is not proof of printing. Confirm physical output before handing over a card.")
-        self.jobs_table=table(["Created (UTC)","Card number","Printer","State","Reason"])
+        self.jobs_table=table(["Created (UTC)","Card number","Printer","Sides","State","Reason"])
         layout.addWidget(self.jobs_table,1)
         actions=QHBoxLayout()
         actions.addWidget(button("Confirm printed",lambda:self.resolve_job("confirmed"),True))
@@ -569,7 +582,9 @@ class MainWindow(QMainWindow):
             mark="DRAFT" if record["status"]=="draft" else "REVOKED" if record["status"]=="revoked" else ""
             path,_=QFileDialog.getSaveFileName(self,"Export front and back","credential.pdf","PDF (*.pdf)")
             if path:
-                export_pdf(path,[render_card(record,template,side,mark) for side in ("front","back")])
+                images=[render_card(record,template,side,mark) for side in ("front","back")]
+                with atomic_output(path) as temporary:
+                    export_pdf(temporary,images)
                 with self.store.transaction():
                     self.store.audit("card.exported",record["id"],record["status"])
                 self.statusBar().showMessage("Two-page CR80 PDF exported. Print at actual size, without scaling.",8000)
@@ -605,9 +620,8 @@ class MainWindow(QMainWindow):
             device=configured_printer(printer.currentText(),mode.currentIndex()==1)
             template=self.store.templates()[record["template"]]
             images=[render_card(record,template,side) for side in ("front","back")]
-            job_id=self.store.prepare_job(record["id"],record["version"],image_bytes(images[0]),image_bytes(images[1]),printer.currentText(),reason.text())
-            with self.store.transaction():
-                self.store.audit("print.sides",job_id,mode.currentText())
+            sides=("front","both","back")[mode.currentIndex()]
+            job_id=self.store.prepare_job(record["id"],record["version"],image_bytes(images[0]),image_bytes(images[1]),printer.currentText(),reason.text(),sides=sides)
             selected=images if mode.currentIndex()==1 else [images[1] if mode.currentIndex()==2 else images[0]]
             try:
                 submit_print(device,selected,job_id)
@@ -669,21 +683,39 @@ class MainWindow(QMainWindow):
             dialog.exec()
         self.guarded(action)
 
+    def import_csv(self):
+        def action():
+            from .importing import read_csv
+            self.store.authorize(admin=True)
+            path,_=QFileDialog.getOpenFileName(self,"Import cardholder drafts","","CSV (*.csv)")
+            if not path:
+                return
+            dialog=CSVImportDialog(self.store,read_csv(path),self)
+            if dialog.exec()==QDialog.DialogCode.Accepted:
+                ids=self.store.import_drafts(dialog.rows,dialog.template.currentText())
+                self.record_offset=0
+                self.refresh_all()
+                QMessageBox.information(self,"Drafts imported",f"{len(ids)} cardholders imported as drafts. Open each record to capture its portrait, signature and authorization before approval.")
+        self.guarded(action)
+
     def export_csv(self):
         def action():
             self.store.authorize(admin=True)
-            rows=self.store.records(self.search.text(),self.status_filter.currentText())
-            path,_=QFileDialog.getSaveFileName(self,"Export current results","cardholders.csv","CSV (*.csv)")
+            path,_=QFileDialog.getSaveFileName(self,"Export all matching cardholders","cardholders.csv","CSV (*.csv)")
             if path:
                 keys=["card_no","full_name","department","expires","status"]
-                with open(path,"w",newline="",encoding="utf-8-sig") as output:
-                    writer=csv.writer(output)
-                    writer.writerow(keys)
-                    for row in rows:
-                        # Prevent spreadsheet formula interpretation of untrusted fields.
-                        writer.writerow([("'"+str(row[k])) if str(row[k]).lstrip().startswith(("=","+","-","@")) else row[k] for k in keys])
+                count=0
+                with atomic_output(path) as temporary:
+                    with temporary.open("w",newline="",encoding="utf-8-sig") as output:
+                        writer=csv.writer(output)
+                        writer.writerow(keys)
+                        for row in self.store.export_records(self.search.text(),self.status_filter.currentText()):
+                            # Prevent spreadsheet formula interpretation of untrusted fields.
+                            writer.writerow([("'"+str(row[k])) if str(row[k]).lstrip().startswith(("=","+","-","@")) else row[k] for k in keys])
+                            count+=1
                 with self.store.transaction():
-                    self.store.audit("records.exported",detail=f"{len(rows)} rows")
+                    self.store.audit("records.exported",detail=f"{count} rows")
+                self.statusBar().showMessage(f"Exported all {count} matching cardholders.",8000)
         self.guarded(action)
 
     def add_user(self):
@@ -753,16 +785,29 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self,"Backup verified and restored",f"Recovered into {folder}.\nClose this application and launch CredentialStudio.exe with --data-dir followed by this folder path. The current workspace is unchanged.")
         self.guarded(action)
 
+    def reset_record_page(self,*_):
+        self.record_offset=0
+        self.refresh_records()
+
+    def move_record_page(self,direction):
+        self.record_offset=max(0,self.record_offset+direction*self.record_page_size)
+        self.refresh_records()
+
     def refresh_records(self,*_):
         if not hasattr(self,"records_table"):
             return
-        rows=self.store.records(self.search.text(),self.status_filter.currentText())
+        count=self.store.record_count(self.search.text(),self.status_filter.currentText())
+        self.record_offset=min(self.record_offset,max(0,((count-1)//self.record_page_size)*self.record_page_size))
+        rows=self.store.records(self.search.text(),self.status_filter.currentText(),limit=self.record_page_size,offset=self.record_offset)
         populate(self.records_table,rows,["card_no","full_name","department","expires","status"])
-        self.record_count.setText(f"{len(rows)} results · limited to the most recent 1,000 matches")
+        first=self.record_offset+1 if count else 0
+        self.record_count.setText(f"Showing {first}–{self.record_offset+len(rows)} of {count} matches")
+        self.previous_page.setEnabled(self.record_offset>0)
+        self.next_page.setEnabled(self.record_offset+len(rows)<count)
 
     def refresh_all(self):
         self.store.authorize()
-        records=self.store.records()
+        records=self.store.records(limit=8)
         populate(self.recent_table,records[:8],["card_no","full_name","department","expires","status"])
         self.refresh_records()
         counts=dict(self.store.db.execute("SELECT status,count(*) FROM records GROUP BY status").fetchall())
@@ -781,8 +826,13 @@ class MainWindow(QMainWindow):
         for row,(name,body) in enumerate(templates.items()):
             for column,text in enumerate((name,body["organization"],"CR80 · front + back")):
                 self.templates_table.setItem(row,column,QTableWidgetItem(text))
-        jobs=self.store.db.execute("SELECT j.id,j.created_at,r.card_no,j.printer,j.status,j.reason FROM jobs j JOIN records r ON j.record_id=r.id ORDER BY j.created_at DESC LIMIT 500").fetchall()
-        populate(self.jobs_table,jobs,["created_at","card_no","printer","status","reason"])
+        jobs=[dict(row) for row in self.store.db.execute("SELECT j.id,j.created_at,r.card_no,j.printer,j.status,j.reason,j.snapshot FROM jobs j JOIN records r ON j.record_id=r.id ORDER BY j.created_at DESC,j.id DESC LIMIT 500")]
+        for job in jobs:
+            job["sides"]=json.loads(job.pop("snapshot")).get("sides","Legacy: see audit")
+        populate(self.jobs_table,jobs,["created_at","card_no","printer","sides","status","reason"])
+        admin=self.store.user["role"]=="admin"
+        self.import_button.setEnabled(admin)
+        self.export_button.setEnabled(admin)
         if self.store.user["role"]=="admin":
             users=self.store.db.execute("SELECT id,username,role,active FROM users ORDER BY username").fetchall()
             audit=self.store.db.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 500").fetchall()

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "credential-studio"
-version = "0.1.0"
+version = "0.2.0"
 description = "Offline Windows identity card enrollment, design, approval and issuance workstation"
 requires-python = ">=3.11,<3.14"
 dependencies = ["PySide6==6.8.3", "pywin32==310; sys_platform == 'win32'"]

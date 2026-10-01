@@ -20,6 +20,16 @@ Save before approval, export or printing. Drafts may be edited. Approved cards r
 
 Closing with unsaved enrollment prompts for discard. Locking preserves unsaved work for the same operator. Ten minutes of idle time triggers a lock. If the application is terminated while locked, unsaved changes are lost; save drafts regularly.
 
+## Rosters, CSV import and exports
+
+Cardholders shows 100 records per page. Use Previous/Next to navigate, and search by full name or card number. Changing the search/filter returns to the first page. The expired filter selects records whose expiry is before the workstation's current date, excluding revoked cards; it does not alter a card's stored issuance status.
+
+Administrators can import UTF-8, comma-separated CSV files up to 2 MB and 1,000 records per batch. Required headers are `card_no,full_name,expires`; optional headers are `department,title`. Dates use `YYYY-MM-DD`. Header spelling must match exactly. Download `docs/cardholders-example.csv` as a starting point. Extra headers, inconsistent column counts and duplicate headers are rejected. Names containing commas must be quoted.
+
+Choose Import CSV, select the file, choose the batch template and review the table. Incorrect dates, missing names/numbers and duplicate card numbers block the entire import. Correct the file and reopen it. No rows are saved until Import drafts is selected. The batch is revalidated on save; a failure rolls back every row and its audit events. Imported cards require their portrait, signature and capture authorization before approval. No image file paths, consent values or approval states can be supplied through CSV.
+
+Export all matches includes all records selected by the current search/filter, without the old 1,000-record limit. Exports include card number, name, department, expiry and status. They do not include images. Potential spreadsheet formulas are neutralized. The roster export is a report, not the enrollment import schema; use the sample file when preparing new imports.
+
 ## Printing and failures
 
 Install and configure the printer’s Windows driver before issuance. Select CR80 stock, the correct tray/feed settings and the intended print quality. Choose the exact printer in the print dialog. Test front-only and duplex modes with sample stock; duplex is requested as short-edge flip, whose mapping must be verified with the vendor driver.
@@ -43,6 +53,10 @@ Reprints of issued cards require an administrator and a reason. Expired, revoked
 ## Backup and restore
 
 An administrator chooses Create backup and stores the ZIP on a protected drive. The database backup API makes a consistent copy, including all images and templates. A SHA-256 manifest detects accidental changes; it does not authenticate the source of a backup. The ZIP is not encrypted. Choose a protected/managed backup destination and verify retention and access controls with the organization.
+
+Backups, roster exports and card PDFs are written into temporary files on the destination drive and replace the chosen file only after successful completion. If writing fails, an existing destination file remains intact. Backup/restore streams the database instead of holding the entire file in memory. Restore supports databases up to 2 GB and validates key tables and foreign-key references. Maintain enough free disk space for the database snapshot and archive. Never interrupt the application while a restore is publishing its recovered database.
+
+Print history now shows the requested front/back/both mode from the saved snapshot. Jobs made with v0.1.0 retain their original snapshots and show “Legacy: see audit”; consult their `print.sides` audit event for the original selection.
 
 Restore backup verifies the archive, database integrity and supported schema, then writes into a new folder. It never overwrites a live database. Close the app and launch the recovered workspace with:
 
