@@ -1,0 +1,62 @@
+name: Windows build and installer
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install build dependencies
+        run: python -m pip install ".[dev]"
+      - name: Test desktop and domain workflows
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+      - name: Package Windows application
+        run: python -m PyInstaller --clean --noconfirm packaging/CredentialStudio.spec
+      - name: Collect third-party notices
+        run: python packaging/collect_notices.py
+      - name: Verify packaged executable
+        run: |
+          $p = Start-Process dist\CredentialStudio\CredentialStudio.exe -ArgumentList '--smoke-test' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw 'Packaged executable failed' }
+      - name: Compile installer
+        run: |
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $compiler)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+          }
+          & $compiler packaging/installer.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
+      - name: Install, launch and uninstall smoke test
+        run: |
+          $folder = Join-Path $env:RUNNER_TEMP 'CredentialStudioSmoke'
+          $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$folder")
+          $p = Start-Process dist\installer\CredentialStudio-0.1.0-Setup-x64.exe -ArgumentList $arguments -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw 'Installer failed' }
+          $p = Start-Process "$folder\CredentialStudio.exe" -ArgumentList '--smoke-test' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw 'Installed executable failed' }
+          $p = Start-Process "$folder\unins000.exe" -ArgumentList '/VERYSILENT' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw 'Uninstall failed' }
+      - name: Installer checksum
+        run: |
+          Get-FileHash dist\installer\*.exe -Algorithm SHA256 | Format-List | Out-File dist\installer\SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CredentialStudio-Windows-x64
+          path: dist/installer/*
+          if-no-files-found: error
+          retention-days: 30
