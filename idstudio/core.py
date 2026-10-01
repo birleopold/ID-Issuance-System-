@@ -11,7 +11,7 @@ import sqlite3
 import tempfile
 import uuid
 import zipfile
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -322,7 +322,7 @@ class Store:
             raise DomainError("Choose a separate backup file.")
         with tempfile.TemporaryDirectory() as temporary:
             backup_db = Path(temporary) / "studio.db"
-            with sqlite3.connect(backup_db) as connection:
+            with closing(sqlite3.connect(backup_db)) as connection:
                 self.db.backup(connection)
             payload = backup_db.read_bytes()
             manifest = {"format": 1, "created_at": now(), "sha256": hashlib.sha256(payload).hexdigest()}
@@ -351,7 +351,7 @@ class Store:
         with tempfile.TemporaryDirectory(dir=folder) as temporary:
             candidate = Path(temporary) / "studio.db"
             candidate.write_bytes(payload)
-            with sqlite3.connect(candidate) as db:
+            with closing(sqlite3.connect(candidate)) as db:
                 if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise DomainError("Backup database is damaged.")
                 if db.execute("PRAGMA user_version").fetchone()[0] != 1:
